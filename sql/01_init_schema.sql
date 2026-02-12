@@ -3,12 +3,22 @@ CREATE SCHEMA IF NOT EXISTS silver;
 CREATE SCHEMA IF NOT EXISTS gold;
 
 CREATE TABLE IF NOT EXISTS bronze.pokemon_cards_raw (
-  ingestion_run_id TEXT NOT NULL,
+  card_id TEXT PRIMARY KEY,
+  last_ingestion_run_id TEXT NOT NULL,
   ingested_at TIMESTAMP NOT NULL DEFAULT NOW(),
   source TEXT NOT NULL,
-  card_id TEXT NOT NULL,
-  raw_json JSONB NOT NULL,
-  PRIMARY KEY (ingestion_run_id, card_id)
+  raw_json JSONB NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS bronze.ingestion_set_checkpoints (
+  source TEXT NOT NULL,
+  set_id TEXT NOT NULL,
+  next_page INTEGER NOT NULL DEFAULT 1,
+  completed BOOLEAN NOT NULL DEFAULT FALSE,
+  last_error TEXT,
+  last_ingestion_run_id TEXT,
+  updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (source, set_id)
 );
 
 CREATE TABLE IF NOT EXISTS silver.pokemon_cards (

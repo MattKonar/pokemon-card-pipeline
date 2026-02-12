@@ -10,17 +10,36 @@ Purpose
 Store raw API responses for traceability and replay.
 
 Grain
-One row per card id per ingestion run.
+One row per card id (latest payload).
 
 Keys
-Unique: ingestion_run_id, card_id
+Primary key: card_id
 
 Columns
-- ingestion_run_id (text) unique identifier for a pipeline run
+- card_id (text) card identifier from the API
+- last_ingestion_run_id (text) latest pipeline run identifier that updated this card
 - ingested_at (timestamp) when the record was ingested
 - source (text) which endpoint produced the record
-- card_id (text) card identifier from the API
 - raw_json (jsonb) raw payload for the card
+
+### bronze_ingestion_set_checkpoints
+Purpose
+Track resumable ingestion progress per set.
+
+Grain
+One row per source and set id.
+
+Keys
+Primary key: source, set_id
+
+Columns
+- source (text) ingestion source name
+- set_id (text) Pokemon set identifier
+- next_page (integer) next page to request for this set
+- completed (boolean) whether the set has been fully ingested
+- last_error (text, nullable) latest error seen while processing this set
+- last_ingestion_run_id (text, nullable) run that last updated the checkpoint
+- updated_at (timestamp) checkpoint last update time
 
 ## Silver layer
 

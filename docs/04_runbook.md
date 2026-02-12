@@ -12,9 +12,9 @@ The pipeline runs from Python and connects to Postgres using environment variabl
 
 1. Install Docker Desktop
 2. Clone repository
-3. Create a .env file with database credentials
+3. Create a `.env` file with `POKEMON_TCG_API_KEY`
 4. Run docker compose up -d
-5. Run python src/main.py
+5. Run `python -m src.main`
 
 ## Expected Services
 
@@ -35,3 +35,4 @@ On first run:
 Pipeline must:
 - Not duplicate rows
 - Use upsert or unique constraints
+- Resume from per-set checkpoints after transient API failures

@@ -1,60 +1,156 @@
+import json
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from sqlalchemy import create_engine, text
 
-BASE_URL = "https://api.pokemontcg.io/v2"
+_ENGINE = None
 
 
-def _headers() -> Dict[str, str]:
-    api_key = os.getenv("POKEMON_TCG_API_KEY", "").strip()
-    if api_key:
-        return {"X-Api-Key": api_key}
-    return {}
+def get_engine():
+    global _ENGINE
+    if _ENGINE is not None:
+        return _ENGINE
+
+    user = os.getenv("POSTGRES_USER", "pokemon")
+    password = os.getenv("POSTGRES_PASSWORD", "pokemon")
+    db = os.getenv("POSTGRES_DB", "pokemon")
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = os.getenv("POSTGRES_PORT", "5432")
+
+    url = f"postgresql+psycopg://{user}:{password}@{host}:{port}/{db}"
+    _ENGINE = create_engine(url, future=True, pool_pre_ping=True)
+    return _ENGINE
 
 
-def _session() -> requests.Session:
-    """Requests session with retries for transient failures and rate limits."""
-    session = requests.Session()
-
-    retry = Retry(
-        total=5,
-        connect=5,
-        read=5,
-        backoff_factor=0.8,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
+def ensure_checkpoint_table() -> None:
+    create_schema_sql = text("CREATE SCHEMA IF NOT EXISTS bronze")
+    create_table_sql = text(
+        """
+        CREATE TABLE IF NOT EXISTS bronze.ingestion_set_checkpoints (
+            source TEXT NOT NULL,
+            set_id TEXT NOT NULL,
+            next_page INTEGER NOT NULL DEFAULT 1,
+            completed BOOLEAN NOT NULL DEFAULT FALSE,
+            last_error TEXT,
+            last_ingestion_run_id TEXT,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (source, set_id)
+        )
+        """
     )
 
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
+    with get_engine().begin() as conn:
+        conn.execute(create_schema_sql)
+        conn.execute(create_table_sql)
 
 
-def fetch_cards_page(page: int = 1, page_size: int = 250) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """Fetch one page of cards from the Pokemon TCG API.
+def get_set_checkpoints(source: str) -> Dict[str, Dict[str, Any]]:
+    sql = text(
+        """
+        SELECT
+            set_id,
+            next_page,
+            completed,
+            last_error,
+            last_ingestion_run_id,
+            updated_at
+        FROM bronze.ingestion_set_checkpoints
+        WHERE source = :source
+        """
+    )
 
-    Returns (cards, meta) where meta includes page, pageSize, count, totalCount when provided.
-    """
-    url = f"{BASE_URL}/cards"
-    params = {"page": page, "pageSize": page_size}
+    with get_engine().begin() as conn:
+        rows = conn.execute(sql, {"source": source}).mappings().all()
 
-    # Timeout tuple: (connect seconds, read seconds)
-    timeout = (10, 120)
+    checkpoints: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        checkpoints[str(row["set_id"])] = {
+            "next_page": int(row["next_page"]),
+            "completed": bool(row["completed"]),
+            "last_error": row["last_error"],
+            "last_ingestion_run_id": row["last_ingestion_run_id"],
+            "updated_at": row["updated_at"],
+        }
+    return checkpoints
 
-    resp = _session().get(url, params=params, headers=_headers(), timeout=timeout)
-    resp.raise_for_status()
 
-    payload = resp.json()
-    cards = payload.get("data", [])
-    meta = {
-        "page": payload.get("page"),
-        "pageSize": payload.get("pageSize"),
-        "count": payload.get("count"),
-        "totalCount": payload.get("totalCount"),
-    }
-    return cards, meta
+def upsert_set_checkpoint(
+    source: str,
+    set_id: str,
+    next_page: int,
+    completed: bool,
+    ingestion_run_id: str,
+    last_error: Optional[str] = None,
+) -> None:
+    sql = text(
+        """
+        INSERT INTO bronze.ingestion_set_checkpoints
+            (source, set_id, next_page, completed, last_error, last_ingestion_run_id)
+        VALUES
+            (:source, :set_id, :next_page, :completed, :last_error, :last_ingestion_run_id)
+        ON CONFLICT (source, set_id)
+        DO UPDATE SET
+            next_page = EXCLUDED.next_page,
+            completed = EXCLUDED.completed,
+            last_error = EXCLUDED.last_error,
+            last_ingestion_run_id = EXCLUDED.last_ingestion_run_id,
+            updated_at = NOW()
+        """
+    )
+
+    with get_engine().begin() as conn:
+        conn.execute(
+            sql,
+            {
+                "source": source,
+                "set_id": set_id,
+                "next_page": max(1, int(next_page)),
+                "completed": completed,
+                "last_error": last_error,
+                "last_ingestion_run_id": ingestion_run_id,
+            },
+        )
+
+
+def insert_bronze_cards(
+    ingestion_run_id: str,
+    source: str,
+    cards: Iterable[Dict[str, Any]],
+) -> int:
+    sql = text(
+        """
+        INSERT INTO bronze.pokemon_cards_raw
+            (card_id, last_ingestion_run_id, source, raw_json)
+        VALUES
+            (:card_id, :last_ingestion_run_id, :source, CAST(:raw_json AS jsonb))
+        ON CONFLICT (card_id)
+        DO UPDATE SET
+            last_ingestion_run_id = EXCLUDED.last_ingestion_run_id,
+            ingested_at = NOW(),
+            source = EXCLUDED.source,
+            raw_json = EXCLUDED.raw_json
+        """
+    )
+
+    payload: List[Dict[str, Any]] = []
+    for card in cards:
+        card_id = card.get("id")
+        if not card_id:
+            continue
+        payload.append(
+            {
+                "card_id": card_id,
+                "last_ingestion_run_id": ingestion_run_id,
+                "source": source,
+                "raw_json": json.dumps(card),
+            }
+        )
+
+    if not payload:
+        return 0
+
+    with get_engine().begin() as conn:
+        conn.execute(sql, payload)
+
+    return len(payload)
