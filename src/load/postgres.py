@@ -1,56 +1,60 @@
 import os
-import json
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, List, Tuple
 
-from sqlalchemy import create_engine, text
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-
-def get_engine():
-    user = os.getenv("POSTGRES_USER", "pokemon")
-    password = os.getenv("POSTGRES_PASSWORD", "pokemon")
-    db = os.getenv("POSTGRES_DB", "pokemon")
-    host = os.getenv("POSTGRES_HOST", "localhost")
-    port = os.getenv("POSTGRES_PORT", "5432")
-
-    url = f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{db}"
-    return create_engine(url, future=True)
+BASE_URL = "https://api.pokemontcg.io/v2"
 
 
-def insert_bronze_cards(
-    ingestion_run_id: str,
-    source: str,
-    cards: Iterable[Dict[str, Any]],
-) -> int:
+def _headers() -> Dict[str, str]:
+    api_key = os.getenv("POKEMON_TCG_API_KEY", "").strip()
+    if api_key:
+        return {"X-Api-Key": api_key}
+    return {}
 
-    engine = get_engine()
 
-    sql = text(
-        """
-        INSERT INTO bronze.pokemon_cards_raw
-            (ingestion_run_id, source, card_id, raw_json)
-        VALUES
-            (:ingestion_run_id, :source, :card_id, CAST(:raw_json AS jsonb))
-        ON CONFLICT (ingestion_run_id, card_id) DO NOTHING
-        """
+def _session() -> requests.Session:
+    """Requests session with retries for transient failures and rate limits."""
+    session = requests.Session()
+
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=0.8,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
     )
 
-    inserted = 0
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
-    with engine.begin() as conn:
-        for card in cards:
-            card_id = card.get("id")
-            if not card_id:
-                continue
 
-            conn.execute(
-                sql,
-                {
-                    "ingestion_run_id": ingestion_run_id,
-                    "source": source,
-                    "card_id": card_id,
-                    "raw_json": json.dumps(card),
-                },
-            )
-            inserted += 1
+def fetch_cards_page(page: int = 1, page_size: int = 250) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Fetch one page of cards from the Pokemon TCG API.
 
-    return inserted
+    Returns (cards, meta) where meta includes page, pageSize, count, totalCount when provided.
+    """
+    url = f"{BASE_URL}/cards"
+    params = {"page": page, "pageSize": page_size}
+
+    # Timeout tuple: (connect seconds, read seconds)
+    timeout = (10, 120)
+
+    resp = _session().get(url, params=params, headers=_headers(), timeout=timeout)
+    resp.raise_for_status()
+
+    payload = resp.json()
+    cards = payload.get("data", [])
+    meta = {
+        "page": payload.get("page"),
+        "pageSize": payload.get("pageSize"),
+        "count": payload.get("count"),
+        "totalCount": payload.get("totalCount"),
+    }
+    return cards, meta
