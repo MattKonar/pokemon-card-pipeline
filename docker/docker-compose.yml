@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: pokemon_postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: pokemon
+      POSTGRES_PASSWORD: pokemon
+      POSTGRES_DB: pokemon
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      - pokemon_pgdata:/var/lib/postgresql/data
+      - ../sql:/docker-entrypoint-initdb.d:ro
+
+volumes:
+  pokemon_pgdata:
